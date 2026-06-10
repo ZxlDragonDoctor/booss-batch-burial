@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BOSS 海投助手</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <div class="header">
+      <h1>🚀 BOSS 海投助手</h1>
+    </div>
+
+    <div class="status-bar">
+      <span id="statusIndicator" class="status-dot stopped"></span>
+      <span id="statusText" class="status-text">已停止</span>
+    </div>
+
+    <button id="toggleBtn" class="toggle-btn start">▶ 开始海投</button>
+
+    <div class="stats">
+      <div class="stat-item">
+        <span class="stat-label">今日投递</span>
+        <span class="stat-value" id="todayCount">0</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">已沟通</span>
+        <span class="stat-value" id="communicatedCount">0</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">已跳过</span>
+        <span class="stat-value" id="skippedCount">0</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">累计</span>
+        <span class="stat-value" id="totalAllTime">0</span>
+      </div>
+    </div>
+
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <div class="progress-text">
+      日限额: <span id="dailyLimitDisplay">100</span> 次
+    </div>
+
+    <div class="log-box" id="logBox" style="display:none;">
+      <div class="log-header">
+        <span>📋 运行日志</span>
+        <button id="clearLogBtn" class="log-clear">清空</button>
+      </div>
+      <div id="logContent" class="log-content"></div>
+    </div>
+
+    <div class="footer">
+      <button id="openOptionsBtn" class="footer-btn">⚙️ 配置</button>
+      <button id="openZhipinBtn" class="footer-btn">🌐 BOSS</button>
+      <button id="debugBtn" class="footer-btn debug">🔍 诊断</button>
+    </div>
+  </div>
+  <script src="../storage.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

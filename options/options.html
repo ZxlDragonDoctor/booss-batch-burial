@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BOSS 海投助手 - 配置</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🚀 BOSS 海投助手</h1>
+      <p class="subtitle">配置你的自动投递参数</p>
+    </header>
+
+    <!-- 岗位筛选 -->
+    <section id="section-filter">
+      <h2>🔍 岗位筛选</h2>
+      <div class="form-group">
+        <label for="keywords">关键词（多个用逗号隔开）</label>
+        <input type="text" id="keywords" placeholder="Java, Python, 后端开发">
+      </div>
+      <div class="form-group">
+        <label for="excludeKeywords">排除关键词</label>
+        <input type="text" id="excludeKeywords" placeholder="实习, 校招, 外包">
+      </div>
+      <div class="form-group">
+        <label for="cities">地区（每行一个）</label>
+        <textarea id="cities" rows="3" placeholder="北京&#10;上海&#10;深圳"></textarea>
+      </div>
+      <div class="form-row">
+        <div class="form-group half">
+          <label for="salaryMin">最低薪资（月薪/K）</label>
+          <input type="number" id="salaryMin" placeholder="15" min="0">
+        </div>
+        <div class="form-group half">
+          <label for="salaryMax">最高薪资（月薪/K）</label>
+          <input type="number" id="salaryMax" placeholder="不限" min="0">
+        </div>
+      </div>
+      <div class="form-group">
+        <label>工作经验要求</label>
+        <div class="checkbox-group" id="experience-group">
+          <label><input type="checkbox" value="不限"> 不限</label>
+          <label><input type="checkbox" value="1年以下"> 1年以下</label>
+          <label><input type="checkbox" value="1-3年"> 1-3年</label>
+          <label><input type="checkbox" value="3-5年"> 3-5年</label>
+          <label><input type="checkbox" value="5-10年"> 5-10年</label>
+          <label><input type="checkbox" value="10年以上"> 10年+</label>
+        </div>
+      </div>
+    </section>
+
+    <!-- 打招呼设置 -->
+    <section id="section-greeting">
+      <h2>💬 打招呼设置</h2>
+      <div class="form-group">
+        <label>话术列表（每行一条，随机选用）</label>
+        <textarea id="greetingMessages" rows="4"
+          placeholder="您好，我对该职位很感兴趣，方便看看我的简历吗？"></textarea>
+      </div>
+      <div class="checkbox-group">
+        <label><input type="checkbox" id="useCompanyPlaceholder"> 添加公司名称占位符 <code>{公司名}</code></label>
+        <label><input type="checkbox" id="useJobPlaceholder"> 添加职位名称占位符 <code>{职位名}</code></label>
+      </div>
+    </section>
+
+    <!-- 投递节奏控制 -->
+    <section id="section-rhythm">
+      <h2>⏱ 投递节奏控制</h2>
+      <div class="form-group">
+        <label for="dailyLimit">每日投递上限（次）</label>
+        <input type="number" id="dailyLimit" value="100" min="1" max="500">
+      </div>
+      <div class="form-row">
+        <div class="form-group half">
+          <label for="intervalMin">最小间隔（秒）</label>
+          <input type="number" id="intervalMin" value="5" min="3" max="60">
+        </div>
+        <div class="form-group half">
+          <label for="intervalMax">最大间隔（秒）</label>
+          <input type="number" id="intervalMax" value="12" min="3" max="60">
+        </div>
+      </div>
+      <div class="checkbox-group">
+        <label><input type="checkbox" id="pauseOnCaptcha"> 遇到验证码时自动暂停</label>
+      </div>
+    </section>
+
+    <!-- 高级设置 -->
+    <section id="section-advanced">
+      <h2>⚙️ 高级设置</h2>
+      <div class="form-group">
+        <label for="blacklist">黑名单公司（多个用逗号隔开）</label>
+        <input type="text" id="blacklist" placeholder="某某科技, 某某信息">
+      </div>
+      <div class="checkbox-group">
+        <label><input type="checkbox" id="skipCommunicated"> 跳过已沟通/已投递的职位</label>
+        <label><input type="checkbox" id="onlyOnline"> 仅投递「在线」状态的 HR</label>
+        <label><input type="checkbox" id="showNotification"> 投递时显示桌面通知</label>
+      </div>
+      <div class="form-group">
+        <label for="searchUrl">搜索入口 URL</label>
+        <input type="url" id="searchUrl" placeholder="https://www.zhipin.com/web/geek/job?query=">
+      </div>
+    </section>
+
+    <!-- 操作按钮 -->
+    <div class="actions">
+      <button id="saveBtn" class="btn-primary">💾 保存配置</button>
+      <button id="resetBtn" class="btn-secondary">↺ 恢复默认</button>
+      <span id="saveStatus" class="save-status"></span>
+    </div>
+  </div>
+  <script src="../storage.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

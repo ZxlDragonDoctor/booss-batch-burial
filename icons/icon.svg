@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="24" fill="#00A5A5"/>
+  <text x="64" y="82" font-size="72" font-weight="bold" text-anchor="middle" fill="white">B</text>
+  <text x="64" y="120" font-size="24" font-weight="bold" text-anchor="middle" fill="white" opacity="0.8">海投</text>
+</svg>
