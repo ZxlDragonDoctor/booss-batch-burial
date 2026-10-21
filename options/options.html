@@ -13,9 +13,19 @@
       <p class="subtitle">配置你的自动投递参数</p>
     </header>
 
+    <section>
+      <h2>每日自动运行</h2>
+      <div class="checkbox-group"><label><input type="checkbox" id="scheduleEnabled"> 每天自动开始沟通</label></div>
+      <div class="form-group"><label for="scheduleTime">执行时间（北京时间）</label><input type="time" id="scheduleTime" required value="09:30"></div>
+      <p>浏览器须保持运行并登录 BOSS。当天错过时间会在启动浏览器后补执行一次；验证码或结果待核查时暂停，处理后手动继续。</p>
+      <p id="lastResult" role="status"></p>
+      <button id="exportRecords" class="btn-secondary">导出沟通记录 JSON</button>
+      <p>“已确认沟通”表示已打招呼，不代表已发送附件简历。待核查记录会保留，以免重复发送。</p>
+    </section>
     <!-- 岗位筛选 -->
     <section id="section-filter">
       <h2>🔍 岗位筛选</h2>
+      <p>地区、薪资和经验请先在 BOSS 搜索页设置，再将完整网址填入下方“搜索入口 URL”；这里保留对应偏好。</p>
       <div class="form-group">
         <label for="keywords">关键词（多个用逗号隔开）</label>
         <input type="text" id="keywords" placeholder="Java, Python, 后端开发">
@@ -83,7 +93,7 @@
         </div>
       </div>
       <div class="checkbox-group">
-        <label><input type="checkbox" id="pauseOnCaptcha"> 遇到验证码时自动暂停</label>
+        <label><input type="checkbox" id="pauseOnCaptcha" checked disabled> 遇到验证码时自动暂停（始终启用）</label>
       </div>
     </section>
 

@@ -7,15 +7,65 @@
   let stopRequested = false;
   let processedKeys = new Set();
   let currentPageKeys = new Set();
+  let runId = '';
+  let successObserved = false;
+  let awaitingSuccess = false;
+  const jobListUrl = location.href;
+  const request = (type, data = {}) => chrome.runtime.sendMessage({ type, runId, ...data });
+  const visible = el => Boolean(el && el.getClientRects().length);
+  function blockingReason() {
+    if (/passport|login/.test(location.pathname)) return '登录已失效，请先登录';
+    const nodes = document.querySelectorAll('[class*="verify"], [class*="captcha"], [class*="dialog"], [class*="modal"], [class*="toast"], iframe');
+    for (const el of nodes) {
+      if (!visible(el)) continue;
+      if (/captcha|verify|geetest/.test(el.className + ' ' + (el.src || ''))) return '请手动完成安全验证';
+      if (/验证码|安全验证|滑块|操作频繁|访问异常|账号异常|今日.*上限|沟通.*上限|明天再来/.test(el.textContent)) return '平台验证或频率限制，请处理后继续';
+      if (/扫码登录|登录后继续|请先登录|短信登录/.test(el.textContent)) return '请先登录 BOSS 直聘';
+    }
+    return '';
+  }
+  async function check() {
+    if (!isRunning || stopRequested) return false;
+    const reason = blockingReason();
+    if (reason) {
+      isRunning = false;
+      await request('PAUSE', { reason });
+      return false;
+    }
+    const state = await request('HEARTBEAT');
+    if (!state?.ok) isRunning = false;
+    return isRunning && !stopRequested;
+  }
+  async function wait(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (!await check()) return false;
+      await sleep(Math.min(500, end - Date.now()));
+    }
+    return check();
+  }
+  function observeSuccess() {
+    if (!awaitingSuccess) return;
+    for (const el of document.querySelectorAll('[class*="dialog"], [class*="modal"], [class*="toast"], [class*="popup"]')) {
+      if (visible(el) && /已向.*发送|已发送.*招呼|打招呼成功|投递成功|发送成功/.test(el.textContent)) successObserved = true;
+    }
+  }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case 'START_BATCH':
+        if (isProcessing) {
+          sendResponse({ status: runId === message.runId && !stopRequested ? 'ok' : 'busy' });
+          return;
+        }
+        runId = message.runId;
         isRunning = true;
         stopRequested = false;
+        sendResponse({ status: 'ok' });
         startBatch();
         break;
       case 'STOP_BATCH':
+        if (message.runId && message.runId !== runId) return;
         isRunning = false;
         stopRequested = true;
         break;
@@ -33,7 +83,7 @@
   }
 
   function log(text, level = 'info') {
-    try { chrome.runtime.sendMessage({ type: 'POPUP_LOG', text, level }).catch(() => {}); } catch(e) {}
+    try { chrome.runtime.sendMessage({ type: 'CONTENT_LOG', text, level }).catch(() => {}); } catch(e) {}
     console.log('[BossHelper]', text);
   }
 
@@ -117,6 +167,8 @@
       }
     });
 
+    results.isLoggedIn = !blockingReason();
+    results.isOnJobList = /\/web\/geek\/jobs?/.test(location.pathname);
     results.textareas = document.querySelectorAll('textarea').length;
     results.detailPanels = document.querySelectorAll('[class*="detail"], .job-detail, [class*="side"]').length;
 
@@ -130,201 +182,103 @@
   async function startBatch() {
     if (isProcessing) return;
     isProcessing = true;
-
+    let reason = '没有更多匹配职位';
     try {
-      await sleep(2000);
-
-      while (isRunning && !stopRequested) {
-        // 扫描职位
-        const jobs = scanJobs();
-        log(`找到 ${jobs.length} 个职位`);
-
+      if (!await wait(2000)) return;
+      processedKeys = new Set(Object.keys((await chrome.storage.local.get({ records: {} })).records));
+      currentPageKeys.clear();
+      while (await check()) {
+        if (await goBackIfOnChatPage()) {
+          if (!await wait(1500)) break;
+          continue;
+        }
+        const config = await Storage.getConfig();
+        const jobs = scanJobs().filter(job => {
+          const title = job.title.toLowerCase();
+          return title && title !== '未知' && !processedKeys.has(job.key) &&
+            (!config.keywords.length || config.keywords.some(k => title.includes(k.toLowerCase()))) &&
+            !(config.excludeKeywords || []).some(k => title.includes(k.toLowerCase())) &&
+            !(config.blacklist || []).some(k => job.company.toLowerCase().includes(k.toLowerCase())) &&
+            (!config.skipCommunicated || !/已沟通|继续沟通/.test(job.clickable.textContent)) &&
+            (!config.onlyOnline || /在线/.test(job.clickable.textContent));
+        });
+        log(`匹配到 ${jobs.length} 个待沟通职位`);
         if (!jobs.length) {
           if (!await scrollPage()) break;
-          await sleep(3000);
           continue;
         }
-
-        // 检查同一页
-        const keys = new Set(jobs.filter(j => j.key).map(j => j.key));
-        if (keys.size > 0 && [...keys].every(k => currentPageKeys.has(k))) {
-          log('同一页无新职位，翻页');
-          if (!await scrollPage()) break;
-          await sleep(3000);
-          currentPageKeys.clear();
-          continue;
-        }
-        currentPageKeys = keys;
-
-        // 筛选
-        const config = await Storage.getConfig();
-        const filtered = jobs.filter(j => {
-          if (!j.title) return false;
-          const t = j.title.toLowerCase();
-          const kw = config.keywords || [];
-          if (kw.length && !kw.some(k => t.includes(k.toLowerCase()))) return false;
-          const ex = config.excludeKeywords || [];
-          if (ex.length && ex.some(k => t.includes(k.toLowerCase()))) return false;
-          if (j.key && processedKeys.has(j.key)) return false;
-          return true;
-        });
-
-        log(`筛选通过 ${filtered.length}/${jobs.length}`);
-
-        if (!filtered.length) {
-          if (!await scrollPage()) break;
-          await sleep(3000);
-          continue;
-        }
-
-        // 处理每个职位
-        for (const job of filtered) {
-          if (!isRunning || stopRequested) break;
-
-          const state = await Storage.getState();
-          if (state.todayCount >= config.dailyLimit) {
-            log('已达日限额', 'warn');
-            chrome.runtime.sendMessage({ type: 'STOP' }).catch(() => {});
-            isRunning = false;
-            break;
-          }
-
-          log(`▶ ${job.title} @ ${job.company || '未知公司'}`);
-          if (job.key) processedKeys.add(job.key);
-
-          // ========== 点击职位卡片 ==========
-          if (job.clickable) {
-            try { job.clickable.click(); } catch(e) {}
-          }
-          await sleep(2000 + Math.random() * 1000);
-
-          // 关掉可能弹出的"选择原因"反馈弹窗
-          dismissFeedbackDialog();
-          await sleep(500);
-
-          // ========== 查找打招呼按钮 ==========
-          const btn = findGreetBtn();
-          if (!btn) {
-            log(`⏭ ${job.title} 无可打招呼按钮`, 'warn');
-            chrome.runtime.sendMessage({ type: 'UPDATE_STATS', data: { skippedCount: 1 } }).catch(() => {});
-            // 仍然尝试关闭面板
+        for (const job of jobs) {
+          if (!await check()) break;
+          if (!job.clickable.isConnected) continue;
+          processedKeys.add(job.key);
+          job.clickable.click();
+          if (!await wait(1800)) break;
+          const btn = findGreetBtn(job);
+          if (!btn || /继续沟通|已沟通/.test(btn.textContent)) {
+            log(`跳过 ${job.title}：未找到可核对职位和公司的沟通按钮`, 'warn');
+            await request('SKIP_JOB');
             closeDetailPanel();
-            await sleep(1000);
             continue;
           }
-
-          // ========== 点击打招呼 ==========
-          log(`👉 点击 "${btn.textContent.trim()}"`, 'info');
-          try { btn.click(); } catch(e) {}
-          await sleep(2000 + Math.random() * 1500);
-
-          // ========== 检查是否有输入框（自定义消息） ==========
-          const textarea = document.querySelector('textarea');
-          if (textarea && textarea.offsetParent !== null) {
-            const msgs = config.greetingMessages || ['您好，我对该职位很感兴趣，方便看看我的简历吗？'];
-            let msg = msgs[Math.floor(Math.random() * msgs.length)];
-            if (config.useCompanyPlaceholder) msg = msg.replace(/\{公司名\}/g, job.company || '贵公司');
-            if (config.useJobPlaceholder) msg = msg.replace(/\{职位名\}/g, job.title);
-            textarea.value = msg;
-            textarea.dispatchEvent(new Event('input', { bubbles: true }));
-            log(`📝 输入消息: "${msg.substring(0, 30)}..."`, 'info');
-            await sleep(800 + Math.random() * 700);
-
-            // 找发送按钮（优先在对话框内找）
-            const dialog = textarea.closest('[class*="dialog"], [class*="modal"], [class*="popup"]');
-            const root = dialog || document;
-            const sendBtns = root.querySelectorAll('button, [class*="btn"]');
-            let sent = false;
-            for (const s of sendBtns) {
-              if (s.offsetParent === null) continue;
-              const t = s.textContent.trim();
-              if (/^(发送|提交|确定|确认|立即发送)$/.test(t)) {
-                log(`📤 点击发送按钮 "${t}"`, 'info');
-                try { s.click(); } catch(e) {}
-                sent = true;
-                break;
-              }
-            }
-            if (!sent) {
-              // Fallback: 找所有可见按钮
-              const all = document.querySelectorAll('button');
-              for (const s of all) {
-                if (s.offsetParent === null) continue;
-                if (/^(发送|提交|确定|确认|立即发送)$/.test(s.textContent.trim())) {
-                  try { s.click(); } catch(e) {}
-                  sent = true;
-                  break;
-                }
-              }
-            }
-            await sleep(2500 + Math.random() * 1500);
-          } else {
-            // 无文本输入框 - 可能是简单模式，等一会儿
-            log('无输入框，等待');
-            await sleep(2000 + Math.random() * 1000);
+          // Record before the first action that may send a message.
+          const reserved = await request('RESERVE_JOB', { job: { key:job.key,title:job.title,company:job.company } });
+          if (!reserved?.ok) { closeDetailPanel(); continue; }
+          if (!await check()) break;
+          successObserved = false;
+          awaitingSuccess = true;
+          btn.click();
+          if (!await wait(1800)) break;
+          const dialog = [...document.querySelectorAll('[class*="dialog"], [class*="modal"], [class*="popup"]')]
+            .find(el => visible(el) && el.querySelector('textarea'));
+          const textarea = dialog?.querySelector('textarea');
+          if (visible(textarea)) {
+            const messages = config.greetingMessages;
+            let text = messages[Math.floor(Math.random() * messages.length)];
+            text = text.replace(/\{公司名\}/g, job.company || '贵公司').replace(/\{职位名\}/g, job.title);
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(textarea, text);
+            textarea.dispatchEvent(new Event('input', {bubbles:true}));
+            const send = [...dialog.querySelectorAll('button, a[class*="btn"]')]
+              .find(el => visible(el) && !el.disabled && /^(发送|立即发送|确定)$/.test(el.textContent.trim()));
+            if (send && await check()) send.click();
           }
-
-          // ========== 检测是否风控 ==========
-          if (isRateLimited()) {
-            log('⛔ 风控限制，暂停', 'error');
-            chrome.runtime.sendMessage({ type: 'PAUSE' }).catch(() => {});
-            isRunning = false;
-            break;
+          const deadline = Date.now() + 8000;
+          while (Date.now() < deadline && await check()) {
+            observeSuccess();
+            if (btn.isConnected && /继续沟通|已沟通/.test(btn.textContent)) successObserved = true;
+            if (successObserved) break;
+            await sleep(250);
           }
-
-          // ========== 成功投递 ==========
-          log(`✅ ${job.title} @ ${job.company || ''}`, 'success');
-          chrome.runtime.sendMessage({
-            type: 'UPDATE_STATS',
-            data: { todayCount: 1, communicatedCount: 1, newTotal: 1 }
-          }).catch(() => {});
-
-          // ========== 清理：先关弹窗，再关面板 ==========
-          // 先关弹出层（它在上层，挡住面板）
+          awaitingSuccess = false;
+          if (!isRunning || stopRequested) break;
+          const status = successObserved ? 'confirmed' : 'unknown';
+          await request('JOB_RESULT', {key:job.key,status});
+          log(`${successObserved ? '已确认沟通' : '结果待核查'}：${job.title} @ ${job.company}`);
+          if (!successObserved || !await check()) break;
           await dismissSuccessPopup();
-          await sleep(500);
-          // 再关详情面板
           closeDetailPanel();
-          await sleep(500);
-
-          // ========== 随机间隔 ==========
-          const min = config.intervalMin || 18;
-          const max = config.intervalMax || 35;
-          const delay = min + Math.random() * (max - min);
-          log(`⏳ 等待 ${delay.toFixed(1)} 秒...`, 'info');
-          await sleep(delay * 1000);
-
-          // 再次检查风控（间隔期间可能被风控）
-          if (isRateLimited()) {
-            log('⛔ 检测到风控，停止', 'error');
-            chrome.runtime.sendMessage({ type: 'PAUSE' }).catch(() => {});
-            isRunning = false;
-            break;
-          }
+          const delay = config.intervalMin + Math.random() * (config.intervalMax - config.intervalMin);
+          if (!await wait(delay * 1000)) break;
         }
       }
-    } catch (err) {
-      console.error('[BossHelper]', err);
-      log('❌ 错误: ' + err.message, 'error');
+    } catch (error) {
+      reason = '运行异常：' + error.message;
+      await request('PAUSE', {reason}).catch(() => {});
+    } finally {
+      awaitingSuccess = false;
+      isRunning = false;
+      isProcessing = false;
+      await request('FINISH', {reason}).catch(() => {});
     }
-
-    isProcessing = false;
-    chrome.runtime.sendMessage({ type: 'STOP' }).catch(() => {});
   }
 
-  // ============================================================
-  // 扫描职位卡片
-  // ============================================================
   function scanJobs() {
     const jobs = [];
     const selectors = [
-      '[class*="job-list"] [class*="card"]',
+      '.job-card-box',
+      '.job-card-wrap',
       '.job-list-box > li',
       '.job-list-box > div',
       '[class*="job-card"]',
-      '[class*="position"] [class*="item"]',
-      '[class*="recruit"] [class*="item"]',
-      '[class*="job"] [class*="list"] [class*="item"]',
     ];
     const cards = document.querySelectorAll(selectors.join(', '));
 
@@ -333,13 +287,14 @@
     }
 
     cards.forEach((card) => {
-      const text = (card.textContent || '').trim().replace(/\s+/g, ' ');
-      const link = card.querySelector('a');
+      const rawText = (card.textContent || '').trim().replace(/\s+/g, ' ');
+      const text = rawText.replace(/[-]/g, '').trim();
+      const link = card.querySelector('a[href*="/job_detail/"]') || card.querySelector('a');
 
       // 提取标题：在 BOSS 直聘 DOM 中，第一个 a 标签通常是标题
-      let title = '';
+      let title = card.querySelector('.job-name, .job-title, [class*="job-name"]')?.textContent.trim() || '';
       const allLinks = card.querySelectorAll('a');
-      for (const a of allLinks) {
+      for (const a of title ? [] : allLinks) {
         const t = a.textContent.trim();
         if (t.length >= 4 && t.length < 40 && !/K·|[0-9]/.test(t) && !/[区市县]/.test(t) && !/科技|有限|公司|集团|股份|工厂|工作室/.test(t)) {
           title = t;
@@ -357,9 +312,9 @@
       }
 
       // 提取公司名
-      let company = '';
+      let company = card.querySelector('.company-name, [class*="company-name"]')?.textContent.trim() || '';
       const areaMatch = text.match(/[^\s]+[·][^\s]*[区市县]/);
-      if (areaMatch && title) {
+      if (!company && areaMatch && title) {
         const idx = text.indexOf(title);
         if (idx >= 0) {
           const afterTitle = text.substring(idx + title.length);
@@ -371,6 +326,16 @@
             .replace(/[・\s]/g, '')
             .trim();
           if (cleaned.length >= 2) company = cleaned;
+        }
+      }
+
+      if (!company && text) {
+        const m = text.match(/([^\s]{2,10}(?:科技|有限|公司|集团|股份|工作室|软件|网络|技术|信息|咨询|国际|企业|工厂|中心))/);
+        if (m) {
+          company = m[1];
+          // 清除公司名前缀中的残留标签字符如 "年" "应届" "本科"
+          company = company.replace(/^[0-9\-]+年/, '').replace(/^年/, '');
+          if (company.length < 2) company = ''; // 清除后太短则放弃
         }
       }
 
@@ -388,13 +353,14 @@
       }
 
       // 去重 key
-      const key = (title + '|' + (company || '')).toLowerCase();
+      const id = link?.getAttribute('href')?.match(/\/job_detail\/([^/?#.]+)/)?.[1];
+      const key = id ? 'job:' + id : (title + '|' + (company || '') + '|' + (card.querySelector('.job-area')?.textContent || '')).toLowerCase();
 
       jobs.push({
         key,
         title: title || '未知',
         company: company || '',
-        clickable: link || card,
+        clickable: card,
       });
     });
 
@@ -412,38 +378,26 @@
   // ============================================================
   function isGreetBtn(el) {
     const t = el.textContent.trim();
-    // 明确排除
-    if (/继续沟通/.test(t)) return false;
-    // 精确匹配主要按钮文本
     if (/^(打招呼|立即沟通|聊一聊|投递)$/.test(t)) return true;
-    // 模糊匹配（针对带图标/状态文字的情况如 "立即沟通 在线"）
     if (/^(打招呼|立即沟通|聊一聊)/.test(t.replace(/\s+/g, ''))) return true;
     return false;
   }
 
-  function findGreetBtn() {
-    // 优先在详情/右侧面板找
-    const panel = document.querySelector(
-      '[class*="detail"], .job-detail, [class*="side"], [class*="right"], [class*="main"]'
-    );
-    const root = panel || document;
-
-    // 选择器覆盖可能的按钮实现
-    const btns = root.querySelectorAll(
-      'button, a[class*="btn"], [class*="chat"], [class*="greet"], ' +
-      '[class*="operate"], [class*="action"]'
-    );
-    for (const btn of btns) {
-      if (btn.offsetParent === null) continue;
-      if (isGreetBtn(btn)) return btn;
-    }
-    // 全页搜索备选
-    const all = document.querySelectorAll(
-      'button, a[class*="btn"], [class*="chat"], [class*="greet"]'
-    );
-    for (const btn of all) {
-      if (btn.offsetParent === null) continue;
-      if (isGreetBtn(btn)) return btn;
+  function findGreetBtn(job) {
+    const buttonIn = root => [...root.querySelectorAll('button, a[class*="btn"], [class*="chat"], [class*="greet"]')]
+      .find(el => visible(el) && !el.disabled && isGreetBtn(el));
+    // A button belonging to the original card has an unambiguous recipient.
+    const cardButton = buttonIn(job.clickable);
+    if (cardButton) return cardButton;
+    const normalize = text => (text || '').replace(/\s+/g, '').toLowerCase();
+    for (const panel of document.querySelectorAll('.job-detail, .job-detail-box, .job-detail-container, .job-detail-wrap, [class*="job-detail"]')) {
+      if (!visible(panel)) continue;
+      const title = panel.querySelector('.job-name, .job-title, h1, h2');
+      const company = panel.querySelector('.company-name, [class*="company-name"]');
+      if (normalize(title?.textContent) !== normalize(job.title)) continue;
+      if (job.company && normalize(company?.textContent) !== normalize(job.company)) continue;
+      const button = buttonIn(panel);
+      if (button) return button;
     }
     return null;
   }
@@ -452,41 +406,43 @@
   // 翻页（滚动加载更多）
   // ============================================================
   async function scrollPage() {
+    if (!await check()) return false;
     log('📜 开始翻页...', 'info');
 
+    const cardsBefore = document.querySelectorAll('.job-card-box, .job-card-wrap, [class*="job-card"]').length;
     const before = document.body.scrollHeight || 0;
 
-    // 策略 1: window.scrollTo（最通用）
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-    // 派发 scroll 事件通知页面
-    window.dispatchEvent(new Event('scroll', { bubbles: true }));
-    await sleep(2000);
-
-    // 策略 2: 找可滚动容器
+    // 策略 1: 找可滚动容器 (排除 detail 面板)
     const containers = document.querySelectorAll(
-      '.job-list-box, [class*="job-list"], [class*="scroll"], ' +
-      '.page-jobs, [class*="container"]'
+      '.job-list-box, [class*="job-list"]:not([class*="detail"]), ' +
+      '[class*="scroll"]:not([class*="detail"]), ' +
+      '.page-jobs, [class*="container"]:not([class*="detail"])'
     );
+    let scrolled = false;
     for (const el of containers) {
       if (el.scrollHeight > el.clientHeight + 50) {
         el.scrollTop = el.scrollHeight;
         el.dispatchEvent(new Event('scroll', { bubbles: true }));
-        await sleep(1000);
+        await sleep(1500);
+        scrolled = true;
+        break;
       }
     }
 
-    // 策略 3: 再次滚动到底 + 等待更久（给 API 加载时间）
+    // 策略 2: 滚动 body
     window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
     window.dispatchEvent(new Event('scroll', { bubbles: true }));
     await sleep(3000);
 
     const after = document.body.scrollHeight || 0;
-    if (after > before + 50) {
-      log(`📜 翻页成功 (${before}→${after})`, 'success');
+    const cardsAfter = document.querySelectorAll('.job-card-box, .job-card-wrap, [class*="job-card"]').length;
+
+    if (cardsAfter > cardsBefore || after > before + 50) {
+      log(`📜 翻页成功 (卡片: ${cardsBefore}→${cardsAfter}, 高度: ${before}→${after})`, 'success');
       return true;
     }
 
-    log('📜 翻页失败，已到底', 'warn');
+    log('📜 翻页失败，已到底或无更多内容', 'warn');
     return false;
   }
 
@@ -601,22 +557,6 @@
   // 关闭右侧详情面板
   // ============================================================
   function closeDetailPanel() {
-    const closeSelectors = [
-      '[class*="detail"] [class*="close"]',
-      '[class*="side"] [class*="close"]',
-      '.job-detail [class*="close"]',
-      '[class*="detail"] .icon-close',
-      '.close',
-      '[class*="detail"] button[class*="close"]',
-    ];
-    for (const sel of closeSelectors) {
-      const btn = document.querySelector(sel);
-      if (btn && btn.offsetParent !== null) {
-        try { btn.click(); } catch(e) {}
-        return;
-      }
-    }
-    // 按 Escape
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
     document.body.click();
   }
@@ -624,16 +564,7 @@
   // ============================================================
   // 增强风控检测
   // ============================================================
-  function isRateLimited() {
-    // inline cursor
-    if (document.body.style.cursor === 'not-allowed') return true;
-    // computed cursor
-    try {
-      const computed = window.getComputedStyle(document.body).cursor;
-      if (computed === 'not-allowed') return true;
-    } catch(e) {}
-    return false;
-  }
+  function isRateLimited() { return Boolean(blockingReason()); }
 
   // ============================================================
   // MutationObserver: 自动检测并关闭弹窗
@@ -642,6 +573,7 @@
     if (autoDismissObserver) return;
     autoDismissObserver = new MutationObserver(() => {
       if (!isRunning) return;
+      observeSuccess();
       // 只在弹窗类元素中查找，排除 app/layout/page 等主容器
       const popups = document.querySelectorAll(
         '[class*="dialog"]:not([class*="app"]):not([class*="layout"]):not([class*="page"]):not([class*="wrap"]), ' +
@@ -681,6 +613,41 @@
 
   // 启动自动弹窗检测
   startAutoDismiss();
+  chrome.runtime.sendMessage({ type: 'READY' }).catch(() => {});
+
+  // ============================================================
+  // 聊天页检测与返回
+  // ============================================================
+  function isOnChatPage() {
+    if (/\/chat\/|\/im\/|web\/chat|geek\/chat/.test(location.href)) return true;
+    try {
+      return !!document.querySelector(
+        '[class*="chat-container"], [class*="im_container"], ' +
+        '[class*="message-chat"], [class*="session-list"], ' +
+        '[class*="chat-header"]'
+      );
+    } catch(e) { return false; }
+  }
+
+  async function goBackIfOnChatPage() {
+    if (!isOnChatPage()) return false;
+    log('⚠️ 误入聊天页面，尝试返回...', 'warn');
+    try {
+      window.history.back();
+      await sleep(2000);
+      if (!isOnChatPage()) {
+        log('✅ history.back() 返回成功');
+        return true;
+      }
+    } catch(e) {}
+    if (jobListUrl && jobListUrl !== location.href && jobListUrl !== 'about:blank') {
+      log('⚠️ 使用 location.href 返回', 'warn');
+      location.href = jobListUrl;
+      await sleep(3000);
+      return true;
+    }
+    return false;
+  }
 
   log('✅ 已加载');
 })();

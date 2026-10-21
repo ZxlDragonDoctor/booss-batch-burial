@@ -1,8 +1,10 @@
-// storage.js - Chrome Storage 封装
+// storage.js - Chrome Storage 封装 (v2.0)
 // 提供配置和状态的默认值、Promise 接口、以及监听能力
 const Storage = {
   // 默认配置
   DEFAULT_CONFIG: {
+    scheduleEnabled: true,
+    scheduleTime: '09:30',
     keywords: [],
     excludeKeywords: [],
     cities: [],
@@ -34,29 +36,56 @@ const Storage = {
     skippedCount: 0,
     totalAllTime: 0,
     lastRunDate: "",
-    pausedOnCaptcha: false
+    pausedOnCaptcha: false,
+    pauseReason: '',
+    runId: '',
+    ownerTabId: null,
+    lastScheduledDate: '',
+    lastResult: '',
+    startedAt: 0,
+    heartbeatAt: 0
   },
 
-  // 获取配置
+  // 获取配置 (带错误兜底)
   async getConfig() {
-    const result = await chrome.storage.sync.get({ config: this.DEFAULT_CONFIG });
-    return { ...this.DEFAULT_CONFIG, ...result.config };
+    try {
+      const result = await chrome.storage.sync.get({ config: this.DEFAULT_CONFIG });
+      return { ...this.DEFAULT_CONFIG, ...result.config };
+    } catch (e) {
+      console.error('[BossHelper] getConfig 失败:', e);
+      throw e;
+    }
   },
 
   // 保存配置
   async saveConfig(config) {
-    await chrome.storage.sync.set({ config });
+    try {
+      await chrome.storage.sync.set({ config });
+    } catch (e) {
+      console.error('[BossHelper] saveConfig 失败:', e);
+      throw e;
+    }
   },
 
-  // 获取状态
+  // 获取状态 (带错误兜底)
   async getState() {
-    const result = await chrome.storage.local.get({ state: this.DEFAULT_STATE });
-    return { ...this.DEFAULT_STATE, ...result.state };
+    try {
+      const result = await chrome.storage.local.get({ state: this.DEFAULT_STATE });
+      return { ...this.DEFAULT_STATE, ...result.state };
+    } catch (e) {
+      console.error('[BossHelper] getState 失败:', e);
+      throw e;
+    }
   },
 
   // 保存状态
   async saveState(state) {
-    await chrome.storage.local.set({ state });
+    try {
+      await chrome.storage.local.set({ state });
+    } catch (e) {
+      console.error('[BossHelper] saveState 失败:', e);
+      throw e;
+    }
   },
 
   // 更新部分状态
@@ -67,9 +96,9 @@ const Storage = {
     return state;
   },
 
-  // 初始化今天的数据（如果日期变更则重置统计）
+  // 初始化今天的数据 (如果日期变更则重置统计)
   async initToday() {
-    const today = new Date().toISOString().split('T')[0];
+    const today = new Date(Date.now() + 8 * 3600000).toISOString().split('T')[0];
     const state = await this.getState();
     if (state.todayDate !== today) {
       state.todayDate = today;
