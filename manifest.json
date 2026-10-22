@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BOSS 海投助手",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "批量自动投递BOSS直聘职位，支持岗位筛选、关键词过滤、自定义打招呼、智能节奏控制",
   "permissions": [
     "storage",

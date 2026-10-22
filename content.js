@@ -62,7 +62,7 @@
         isRunning = true;
         stopRequested = false;
         sendResponse({ status: 'ok' });
-        startBatch();
+        startBatch(message.activeJob || null);
         break;
       case 'STOP_BATCH':
         if (message.runId && message.runId !== runId) return;
@@ -171,6 +171,8 @@
     results.isOnJobList = /\/web\/geek\/jobs?/.test(location.pathname);
     results.textareas = document.querySelectorAll('textarea').length;
     results.detailPanels = document.querySelectorAll('[class*="detail"], .job-detail, [class*="side"]').length;
+    results.jobs = scanJobs().slice(0,3).map(({id,title,company,href}) => ({id,title,company,href}));
+    results.details = detailCandidates().slice(0,3).map(panel => ({id:identityOf(panel),title:titleOf(panel),company:companyOf(panel)}));
 
     log('🔍 诊断结果: ' + JSON.stringify(results, null, 2).substring(0, 2000), 'info');
     return results;
@@ -179,14 +181,41 @@
   // ============================================================
   // 主流程
   // ============================================================
-  async function startBatch() {
+  async function startBatch(activeJob = null) {
     if (isProcessing) return;
     isProcessing = true;
     let reason = '没有更多匹配职位';
+    let lookupFailures = 0;
+    let confirmedThisRun = 0;
+    let navigating = false;
     try {
       if (!await wait(2000)) return;
       processedKeys = new Set(Object.keys((await chrome.storage.local.get({ records: {} })).records));
       currentPageKeys.clear();
+      if (activeJob) {
+        const job = {...activeJob, clickable:document.createElement('div')};
+        if (idFromUrl(location.href) !== job.id) throw new Error('详情页职位 ID 与任务目标不一致');
+        const btn = await waitForGreetBtn(job);
+        if (!btn) {
+          if (isRunning && !stopRequested) {
+            log('详情定位诊断：' + detailDiagnostic(job), 'warn');
+            await request('PAUSE', {reason:'完整详情页无法核对职位或沟通按钮，请查看诊断'});
+          }
+          return;
+        }
+        const existing = /继续沟通|已沟通/.test(btn.textContent);
+        if (existing) await request('JOB_EXISTING', {job:{key:job.key,title:job.title,company:job.company}});
+        const confirmed = existing || await communicate(job, btn, await Storage.getConfig());
+        if (confirmed && await check()) {
+          const config = await Storage.getConfig();
+          const delay = config.intervalMin + Math.random() * (config.intervalMax - config.intervalMin);
+          if (!await wait(delay * 1000)) return;
+          navigating = true;
+          const reply = await request('RETURN_TO_LIST');
+          if (!reply?.ok) navigating = false;
+        }
+        return;
+      }
       while (await check()) {
         if (await goBackIfOnChatPage()) {
           if (!await wait(1500)) break;
@@ -211,195 +240,199 @@
           if (!await check()) break;
           if (!job.clickable.isConnected) continue;
           processedKeys.add(job.key);
-          job.clickable.click();
-          if (!await wait(1800)) break;
-          const btn = findGreetBtn(job);
-          if (!btn || /继续沟通|已沟通/.test(btn.textContent)) {
-            log(`跳过 ${job.title}：未找到可核对职位和公司的沟通按钮`, 'warn');
-            await request('SKIP_JOB');
+          // Trigger the actual title/link handler, while keeping the task in
+          // its owning tab. A link default alone must not open an unowned tab.
+          job.openTarget.addEventListener('click', event => event.preventDefault(), {once:true});
+          job.openTarget.click();
+          const btn = await waitForGreetBtn(job);
+          if (!isRunning || stopRequested) break;
+          if (!btn && job.href && job.id) {
+            log(`右侧详情不可用，进入职位详情页：${job.title}`);
+            navigating = true;
+            const reply = await request('OPEN_JOB_DETAIL', {job:{key:job.key,id:job.id,title:job.title,company:job.company,href:job.href}});
+            if (reply?.ok) return;
+            navigating = false;
+          }
+          if (btn && /继续沟通|已沟通/.test(btn.textContent)) {
+            await request('JOB_EXISTING', {job:{key:job.key,title:job.title,company:job.company}});
+            log(`跳过已沟通职位：${job.title}`);
             closeDetailPanel();
             continue;
           }
-          // Record before the first action that may send a message.
-          const reserved = await request('RESERVE_JOB', { job: { key:job.key,title:job.title,company:job.company } });
-          if (!reserved?.ok) { closeDetailPanel(); continue; }
-          if (!await check()) break;
-          successObserved = false;
-          awaitingSuccess = true;
-          btn.click();
-          if (!await wait(1800)) break;
-          const dialog = [...document.querySelectorAll('[class*="dialog"], [class*="modal"], [class*="popup"]')]
-            .find(el => visible(el) && el.querySelector('textarea'));
-          const textarea = dialog?.querySelector('textarea');
-          if (visible(textarea)) {
-            const messages = config.greetingMessages;
-            let text = messages[Math.floor(Math.random() * messages.length)];
-            text = text.replace(/\{公司名\}/g, job.company || '贵公司').replace(/\{职位名\}/g, job.title);
-            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(textarea, text);
-            textarea.dispatchEvent(new Event('input', {bubbles:true}));
-            const send = [...dialog.querySelectorAll('button, a[class*="btn"]')]
-              .find(el => visible(el) && !el.disabled && /^(发送|立即发送|确定)$/.test(el.textContent.trim()));
-            if (send && await check()) send.click();
+          if (!btn) {
+            log(`跳过 ${job.title}：未找到可核对职位和公司的沟通按钮`, 'warn');
+            log('详情定位诊断：' + detailDiagnostic(job), 'warn');
+            lookupFailures++;
+            await request('SKIP_JOB');
+            closeDetailPanel();
+            if (lookupFailures >= 3) {
+              await request('PAUSE', {reason:'连续三个职位无法匹配详情或沟通按钮，请查看详情定位诊断'});
+              isRunning = false;
+              break;
+            }
+            continue;
           }
-          const deadline = Date.now() + 8000;
-          while (Date.now() < deadline && await check()) {
-            observeSuccess();
-            if (btn.isConnected && /继续沟通|已沟通/.test(btn.textContent)) successObserved = true;
-            if (successObserved) break;
-            await sleep(250);
-          }
-          awaitingSuccess = false;
-          if (!isRunning || stopRequested) break;
-          const status = successObserved ? 'confirmed' : 'unknown';
-          await request('JOB_RESULT', {key:job.key,status});
-          log(`${successObserved ? '已确认沟通' : '结果待核查'}：${job.title} @ ${job.company}`);
-          if (!successObserved || !await check()) break;
+          const confirmed = await communicate(job, btn, config);
+          if (confirmed) confirmedThisRun++;
+          if (!confirmed || !await check()) break;
           await dismissSuccessPopup();
           closeDetailPanel();
           const delay = config.intervalMin + Math.random() * (config.intervalMax - config.intervalMin);
           if (!await wait(delay * 1000)) break;
         }
+        if (isRunning && !confirmedThisRun && lookupFailures) {
+          await request('PAUSE', {reason:'本次未能匹配职位详情或沟通按钮，请查看详情定位诊断'});
+          isRunning = false;
+        }
       }
     } catch (error) {
+      if (navigating) return; // The old document's message port can close during an intentional navigation.
       reason = '运行异常：' + error.message;
       await request('PAUSE', {reason}).catch(() => {});
     } finally {
       awaitingSuccess = false;
       isRunning = false;
       isProcessing = false;
-      await request('FINISH', {reason}).catch(() => {});
+      if (!navigating) await request('FINISH', {reason}).catch(() => {});
     }
   }
 
+  async function communicate(job, btn, config) {
+    // Record before the first action that may send a message.
+    const reserved = await request('RESERVE_JOB', { job: { key:job.key,title:job.title,company:job.company } });
+    if (!reserved?.ok) return false;
+    if (!await check()) return false;
+    successObserved = false;
+    awaitingSuccess = true;
+    btn.click();
+    if (!await wait(1800)) return false;
+    const dialog = [...document.querySelectorAll('[class*="dialog"], [class*="modal"], [class*="popup"]')]
+      .find(el => visible(el) && el.querySelector('textarea'));
+    const textarea = dialog?.querySelector('textarea');
+    if (visible(textarea)) {
+      const messages = config.greetingMessages;
+      let text = messages[Math.floor(Math.random() * messages.length)];
+      text = text.replace(/\{公司名\}/g, job.company || '贵公司').replace(/\{职位名\}/g, job.title);
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(textarea, text);
+      textarea.dispatchEvent(new Event('input', {bubbles:true}));
+      const send = [...dialog.querySelectorAll('button, a[class*="btn"]')]
+        .find(el => visible(el) && !el.disabled && /^(发送|立即发送|确定)$/.test(el.textContent.trim()));
+      if (send && await check()) send.click();
+    }
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline && await check()) {
+      observeSuccess();
+      if (btn.isConnected && /继续沟通|已沟通/.test(btn.textContent)) successObserved = true;
+      if (successObserved) break;
+      await sleep(250);
+    }
+    awaitingSuccess = false;
+    if (!isRunning || stopRequested) return false;
+    const status = successObserved ? 'confirmed' : 'unknown';
+    await request('JOB_RESULT', {key:job.key,status});
+    log(`${successObserved ? '已确认沟通' : '结果待核查'}：${job.title} @ ${job.company}`);
+    return successObserved;
+  }
+
+  function cleanTitle(text) {
+    return (text || '').replace(/\s+/g, ' ').trim()
+      .replace(/\s*[0-9\uE000-\uF8FF]+(?:[.\-~～—–][0-9\uE000-\uF8FF]+)*\s*[kK万千元](?:.*薪)?\s*$/, '').trim();
+  }
+  function titleOf(root) {
+    // querySelector with a comma list follows document order, so the outer
+    // .job-name row used to win over its more precise .job-title child.
+    for (const selector of ['.job-banner h1', '.job-banner .name', '.info-primary .name', '.job-title', '.job-name', '[class*="job-title"]', 'h1', 'h2', '.name']) {
+      const el = root.matches?.(selector) ? root : root.querySelector(selector);
+      if (!el) continue;
+      const copy = el.cloneNode(true);
+      copy.querySelectorAll('[class*="salary"], .job-area, .job-labels').forEach(node => node.remove());
+      const text = cleanTitle(copy.textContent);
+      if (text) return text;
+    }
+    return '';
+  }
+  function companyOf(root) {
+    const el = root.querySelector('.company-name, [class*="company-name"], .company-info .name, a[href*="/gongsi/"]');
+    return (el?.getAttribute('title') || el?.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+  function idFromUrl(url) {
+    return (url || '').match(/\/job_detail\/([^/?#.]+)/)?.[1] || '';
+  }
   function scanJobs() {
     const jobs = [];
-    const selectors = [
-      '.job-card-box',
-      '.job-card-wrap',
-      '.job-list-box > li',
-      '.job-list-box > div',
-      '[class*="job-card"]',
-    ];
-    const cards = document.querySelectorAll(selectors.join(', '));
-
-    if (cards.length === 0) {
-      log('⚠️ 未匹配到任何卡片（点击诊断查看详情）', 'warn');
-    }
-
-    cards.forEach((card) => {
-      const rawText = (card.textContent || '').trim().replace(/\s+/g, ' ');
-      const text = rawText.replace(/[-]/g, '').trim();
-      const link = card.querySelector('a[href*="/job_detail/"]') || card.querySelector('a');
-
-      // 提取标题：在 BOSS 直聘 DOM 中，第一个 a 标签通常是标题
-      let title = card.querySelector('.job-name, .job-title, [class*="job-name"]')?.textContent.trim() || '';
-      const allLinks = card.querySelectorAll('a');
-      for (const a of title ? [] : allLinks) {
-        const t = a.textContent.trim();
-        if (t.length >= 4 && t.length < 40 && !/K·|[0-9]/.test(t) && !/[区市县]/.test(t) && !/科技|有限|公司|集团|股份|工厂|工作室/.test(t)) {
-          title = t;
-          break; // 取第一个匹配的（标题总是在公司名之前）
-        }
-      }
-      // 从全文本里找（备选）
-      if (!title) {
-        const parts = text.split(/[\s]+/);
-        for (const p of parts) {
-          if (p.length >= 4 && !/K·|[0-9\-]/.test(p) && !/[区市县]/.test(p) && !/经验|学历|本科|大专|应届/.test(p) && !/科技|有限|公司|集团|股份|工厂|工作室/.test(p)) {
-            title = p; break;
-          }
-        }
-      }
-
-      // 提取公司名
-      let company = card.querySelector('.company-name, [class*="company-name"]')?.textContent.trim() || '';
-      const areaMatch = text.match(/[^\s]+[·][^\s]*[区市县]/);
-      if (!company && areaMatch && title) {
-        const idx = text.indexOf(title);
-        if (idx >= 0) {
-          const afterTitle = text.substring(idx + title.length);
-          const beforeArea = afterTitle.substring(0, afterTitle.indexOf(areaMatch[0]));
-          const cleaned = beforeArea
-            .replace(/[0-9-Kk\-·~～]+/g, '')
-            .replace(/在校|应届|本科|大专|硕士|博士|经验|学历/g, '')
-            .replace(/\b[A-Za-z#+()（）]+\b/g, '')
-            .replace(/[・\s]/g, '')
-            .trim();
-          if (cleaned.length >= 2) company = cleaned;
-        }
-      }
-
-      if (!company && text) {
-        const m = text.match(/([^\s]{2,10}(?:科技|有限|公司|集团|股份|工作室|软件|网络|技术|信息|咨询|国际|企业|工厂|中心))/);
-        if (m) {
-          company = m[1];
-          // 清除公司名前缀中的残留标签字符如 "年" "应届" "本科"
-          company = company.replace(/^[0-9\-]+年/, '').replace(/^年/, '');
-          if (company.length < 2) company = ''; // 清除后太短则放弃
-        }
-      }
-
-      // 如果还没找到公司名，尝试另一种方式
-      if (!company) {
-        // 找可能包含公司名的元素
-        const allSpans = card.querySelectorAll('span, div, a');
-        for (const el of allSpans) {
-          const t = (el.textContent || '').trim();
-          if (t.length >= 2 && t.length <= 20 && /科技|有限|公司|集团|股份|工作室/.test(t) && !/[区市县]/.test(t)) {
-            company = t;
-            break;
-          }
-        }
-      }
-
-      // 去重 key
-      const id = link?.getAttribute('href')?.match(/\/job_detail\/([^/?#.]+)/)?.[1];
-      const key = id ? 'job:' + id : (title + '|' + (company || '') + '|' + (card.querySelector('.job-area')?.textContent || '')).toLowerCase();
-
-      jobs.push({
-        key,
-        title: title || '未知',
-        company: company || '',
-        clickable: card,
-      });
-    });
-
-    // 去重（同一页可能有多个匹配）
     const seen = new Set();
-    return jobs.filter(j => {
-      if (seen.has(j.key)) return false;
-      seen.add(j.key);
-      return true;
-    });
+    const cards = document.querySelectorAll('.job-card-wrapper, .job-card-box, .job-card-wrap, .job-list-box > li, [class*="job-card"]');
+    for (const card of cards) {
+      const links = [...card.querySelectorAll('a[href*="/job_detail/"]')];
+      if (card.matches('a[href*="/job_detail/"]')) links.unshift(card);
+      const ids = new Set(links.map(link => idFromUrl(link.getAttribute('href'))).filter(Boolean));
+      if (ids.size > 1) continue; // A list container is not a job card.
+      const link = links[0];
+      const title = titleOf(card) || cleanTitle(link?.getAttribute('title') || link?.textContent);
+      if (!title) continue;
+      const company = companyOf(card);
+      const id = idFromUrl(link?.getAttribute('href')) || card.dataset.jobId || '';
+      const key = id ? 'job:' + id : (title + '|' + company + '|' + (card.querySelector('.job-area')?.textContent || '')).toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      jobs.push({key,id,title,company,href:link?.href || '',clickable:card,openTarget:link || card.querySelector('.job-title, .job-name') || card});
+    }
+    return jobs;
   }
-
-  // ============================================================
-  // 查找"打招呼"按钮
-  // ============================================================
   function isGreetBtn(el) {
-    const t = el.textContent.trim();
-    if (/^(打招呼|立即沟通|聊一聊|投递)$/.test(t)) return true;
-    if (/^(打招呼|立即沟通|聊一聊)/.test(t.replace(/\s+/g, ''))) return true;
-    return false;
+    return /^(打招呼|立即沟通|聊一聊|投递)(?:[\s\uE000-\uF8FF]*)$/.test(el.textContent.trim());
   }
-
+  function detailCandidates() {
+    const panels = [...document.querySelectorAll('.job-detail, .job-detail-box, .job-detail-container, .job-detail-wrap, .job-banner, [class*="job-detail"], [role="dialog"]')].filter(visible);
+    // On a full detail page the URL is authoritative. Never scan the entire
+    // search page for a button belonging to an unrelated job.
+    if (idFromUrl(location.href)) panels.push(document.body);
+    return panels;
+  }
+  function identityOf(panel) {
+    return panel.dataset.jobId || panel.querySelector('.job-banner[data-job-id]')?.dataset.jobId ||
+      panel.querySelector('[data-current-job-id]')?.getAttribute('data-current-job-id') ||
+      panel.getAttribute('data-current-job-id') ||
+      idFromUrl(panel.querySelector('.job-banner a[href*="/job_detail/"], a.job-name[href*="/job_detail/"]')?.getAttribute('href')) ||
+      (panel === document.body ? idFromUrl(location.href) : '');
+  }
   function findGreetBtn(job) {
-    const buttonIn = root => [...root.querySelectorAll('button, a[class*="btn"], [class*="chat"], [class*="greet"]')]
-      .find(el => visible(el) && !el.disabled && isGreetBtn(el));
-    // A button belonging to the original card has an unambiguous recipient.
+    const buttonIn = root => [...root.querySelectorAll('button, a[class*="btn"], a[class*="chat"], [role="button"]')]
+      .find(el => visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' &&
+        (isGreetBtn(el) || /^(继续沟通|已沟通)$/.test(el.textContent.trim())));
     const cardButton = buttonIn(job.clickable);
     if (cardButton) return cardButton;
     const normalize = text => (text || '').replace(/\s+/g, '').toLowerCase();
-    for (const panel of document.querySelectorAll('.job-detail, .job-detail-box, .job-detail-container, .job-detail-wrap, [class*="job-detail"]')) {
-      if (!visible(panel)) continue;
-      const title = panel.querySelector('.job-name, .job-title, h1, h2');
-      const company = panel.querySelector('.company-name, [class*="company-name"]');
-      if (normalize(title?.textContent) !== normalize(job.title)) continue;
-      if (job.company && normalize(company?.textContent) !== normalize(job.company)) continue;
-      const button = buttonIn(panel);
+    for (const panel of detailCandidates()) {
+      const id = identityOf(panel);
+      const title = titleOf(panel);
+      if (id && job.id && id !== job.id) continue;
+      const sameId = id && job.id && id === job.id;
+      if (!sameId && title && normalize(title) !== normalize(job.title)) continue;
+      const sameNames = normalize(title) === normalize(job.title) && job.company &&
+        normalize(companyOf(panel)) === normalize(job.company);
+      if (!sameId && !sameNames) continue;
+      const scope = panel === document.body ? panel.querySelector('.job-banner, .info-primary, .job-detail-container, main') : panel;
+      const button = scope && buttonIn(scope);
       if (button) return button;
     }
     return null;
+  }
+  async function waitForGreetBtn(job) {
+    const until = Date.now() + 4500;
+    while (await check()) {
+      const button = findGreetBtn(job);
+      if (button) return button;
+      if (Date.now() >= until) break;
+      await sleep(250);
+    }
+    return null;
+  }
+  function detailDiagnostic(job) {
+    const panels = detailCandidates();
+    return JSON.stringify({card:{id:job.id,title:job.title,company:job.company},
+      details:panels.slice(0,4).map(panel=>({id:identityOf(panel),title:titleOf(panel),company:companyOf(panel),
+        buttons:[...panel.querySelectorAll('button, a[class*="btn"], a[class*="chat"]')].filter(visible).map(el=>el.textContent.trim()).slice(0,5)}))});
   }
 
   // ============================================================
@@ -649,5 +682,5 @@
     return false;
   }
 
-  log('✅ 已加载');
+  log('✅ 已加载 v' + (chrome.runtime.getManifest?.()?.version || '开发版'));
 })();

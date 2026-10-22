@@ -16,7 +16,7 @@ function harness() {
     notifications: { async create() {} },
     tabs: { async query() { return [{ id: 7, url: 'https://www.zhipin.com/web/geek/jobs', active: true }]; },
       async get(id) { return { id }; }, async sendMessage(id,msg) { sent.push({id,msg}); return {status:'ok'}; },
-      async create() { return {id:7}; }, onRemoved: event('removed') }
+      async create() { return {id:7}; }, async update(id,data) { sent.push({id,navigate:data.url}); return {id}; }, onRemoved: event('removed') }
   };
   const ctx = vm.createContext({ chrome, console, Date, URL, setTimeout, clearTimeout, crypto: require('node:crypto').webcrypto });
   ctx.importScripts = (...paths) => paths.forEach(p => vm.runInContext(fs.readFileSync(p,'utf8'),ctx));
@@ -93,4 +93,27 @@ test('作为独立标签页打开的扩展控制面板也能启动任务', async
   const h=harness();h.db.sync.config={keywords:['Java'],scheduleEnabled:false};
   const reply=await h.message({type:'START'},99,{tab:{id:99},url:'chrome-extension://test/popup/popup.html'});
   assert.equal(reply.ok,true);
+});
+test('完整详情导航保留任务归属，READY 携带目标岗位，拒绝外部网址',async()=>{
+  const h=harness();h.db.sync.config={keywords:['Java'],scheduleEnabled:false};
+  await h.message({type:'START'});
+  const {runId}=await h.message({type:'GET_STATE'});
+  const job={key:'job:abc',id:'abc',title:'Java开发',company:'测试',href:'https://www.zhipin.com/job_detail/abc.html'};
+  assert.equal((await h.message({type:'OPEN_JOB_DETAIL',runId,job:{...job,href:'https://evil.example/job_detail/abc.html'}})).ok,false);
+  assert.equal((await h.message({type:'OPEN_JOB_DETAIL',runId,job})).ok,true);
+  assert.equal(h.sent.at(-1).navigate,job.href);
+  await h.message({type:'READY'});
+  assert.equal(h.sent.at(-1).msg.activeJob.key,job.key);
+  await h.message({type:'RETURN_TO_LIST',runId});
+  assert.match(h.sent.at(-1).navigate,/\/web\/geek\/jobs/);
+  assert.equal((await h.message({type:'GET_STATE'})).activeJob,null);
+});
+test('平台已沟通的岗位记为 existing，跳过而不增加成功数',async()=>{
+  const h=harness();h.db.sync.config={keywords:['Java'],scheduleEnabled:false};
+  await h.message({type:'START'});
+  const {runId}=await h.message({type:'GET_STATE'});
+  const job={key:'job:existing',title:'Java开发',company:'测试公司'};
+  assert.equal((await h.message({type:'JOB_EXISTING',runId,job})).ok,true);
+  assert.equal(h.db.local.records[job.key].status,'existing');
+  assert.equal((await h.message({type:'GET_STATE'})).todayCount,0);
 });

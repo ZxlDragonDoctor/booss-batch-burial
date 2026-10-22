@@ -32,7 +32,7 @@ async function finish(reason, paused = false) {
   }
   await chrome.storage.local.set({records});
   await Storage.updateState({ isRunning:false, pausedOnCaptcha:paused,
-    pauseReason:paused ? reason : '', lastResult:reason, lastFinishedAt:Date.now() });
+    pauseReason:paused ? reason : '', lastResult:reason, lastFinishedAt:Date.now(), activeJob:null });
   await stopTab(state);
   await log(reason, paused ? 'warn' : 'info');
   notify(paused ? '任务需要处理' : '本次沟通结束', `${reason}；今日已确认沟通 ${state.todayCount} 次`);
@@ -43,7 +43,8 @@ function owns(state, message, sender) {
 async function dispatch(tabId, runId) {
   // A new tab will announce READY once its content script is installed.
   try {
-    const reply = await chrome.tabs.sendMessage(tabId, {type:'START_BATCH', runId});
+    const state = await Storage.getState();
+    const reply = await chrome.tabs.sendMessage(tabId, {type:'START_BATCH', runId, activeJob:state.activeJob || null});
     return reply?.status === 'ok';
   } catch { return false; }
 }
@@ -66,7 +67,7 @@ async function start(resume = false) {
   const runId = crypto.randomUUID();
   await Storage.updateState({isRunning:true, pausedOnCaptcha:false, pauseReason:'', runId,
     ownerTabId:tab.id, lastRunDate:Daily.dayKey(), startedAt:Date.now(), heartbeatAt:Date.now(),
-    lastResult:'等待职位页面就绪'});
+    lastResult:'等待职位页面就绪',activeJob:null,returnUrl:''});
   await dispatch(tab.id, runId);
   await log('任务已启动，等待页面扫描');
   return {ok:true, runId};
@@ -91,6 +92,26 @@ async function route(message, sender) {
     return {ok:true};
   }
   if (!owns(state,message,sender)) return {ok:false,reason:'非当前任务'};
+  if (message.type === 'OPEN_JOB_DETAIL') {
+    if (!state.isRunning) return {ok:false};
+    const job = message.job;
+    let url, list;
+    try { url = new URL(job.href); list = new URL(sender.tab.url); } catch { return {ok:false}; }
+    const id = url.pathname.match(/^\/job_detail\/([^/.]+)\.html$/)?.[1];
+    if (url.protocol !== 'https:' || !['www.zhipin.com','zhipin.com'].includes(url.hostname) ||
+        !id || job.key !== 'job:' + id || list.protocol !== 'https:' ||
+        !['www.zhipin.com','zhipin.com'].includes(list.hostname) || !/^\/web\/geek\/jobs?\/?$/.test(list.pathname)) return {ok:false};
+    await Storage.updateState({activeJob:{key:job.key,id,title:job.title,company:job.company,href:url.href},returnUrl:list.href,heartbeatAt:Date.now()});
+    await chrome.tabs.update(state.ownerTabId,{url:url.href});
+    return {ok:true};
+  }
+  if (message.type === 'RETURN_TO_LIST') {
+    if (!state.isRunning || !state.activeJob || !state.returnUrl) return {ok:false};
+    const url = state.returnUrl;
+    await Storage.updateState({activeJob:null,returnUrl:'',heartbeatAt:Date.now()});
+    await chrome.tabs.update(state.ownerTabId,{url});
+    return {ok:true};
+  }
   if (message.type === 'HEARTBEAT') {
     if (!state.isRunning) return {ok:false};
     await Storage.updateState({heartbeatAt:Date.now()});
@@ -113,6 +134,17 @@ async function route(message, sender) {
     records[job.key] = {key:job.key, title:String(job.title || '').slice(0,100),
       company:String(job.company || '').slice(0,100), status:'pending', runId:state.runId, updatedAt:Date.now()};
     await chrome.storage.local.set({records});
+    return {ok:true};
+  }
+  if (message.type === 'JOB_EXISTING') {
+    const job = message.job;
+    if (!state.isRunning || !job || typeof job.key !== 'string' || !job.key || job.key.length > 500) return {ok:false};
+    const {records={}} = await chrome.storage.local.get({records:{}});
+    if (!Object.hasOwn(records,job.key)) {
+      records[job.key] = {key:job.key,title:String(job.title || '').slice(0,100),company:String(job.company || '').slice(0,100),status:'existing',updatedAt:Date.now()};
+      state.skippedCount++;
+      await chrome.storage.local.set({records,state});
+    }
     return {ok:true};
   }
   if (message.type === 'JOB_RESULT') {
